@@ -5,13 +5,13 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/Wkesther2/bme680-driver)
 
 ## Table of Contents
-- [Overview](#-overview)
-- [Features](#-features)
-- [Repository Structure](#-repository-structure)
-- [Installation](#-installation)
-- [Quick Start](#-quick-start-stm32-example)
-- [Units & Precision](#-units-&-precision)
-- [License](#-license)
+- [Overview](#overview)
+- [Features](#features)
+- [Repository Structure](#repository-structure)
+- [Installation](#installation)
+- [Quick Start](#quick-start-stm32-example)
+- [Units & Precision](#units-and-precision)
+- [License](#license)
 
 ---
 
@@ -107,7 +107,7 @@ loop {
 
 ---
 
-## Units & Precision
+## Units and Precision
 
 | Measurement | Unit | Scaling | Example |
 | :--- | :--- | :--- | :--- |
