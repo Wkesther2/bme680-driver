@@ -53,7 +53,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bme680-driver = "0.2.0"
+bme680-driver = "0.2.1"
 ```
 
 ---

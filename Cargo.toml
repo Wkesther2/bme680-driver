@@ -1,6 +1,6 @@
 [package]
 name = "bme680-driver"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Gabriel Zuser <zusergabriel@gmail.com>"]
 edition = "2024"
 description = "A type-safe, no_std driver for the Bosch BME680 environmental sensor using embedded-hal"
@@ -26,9 +26,7 @@ defmt-rtt = "1.0"
 rtt-target = "0.6.2"
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
-[dependencies.stm32f4xx-hal]
-version = "0.23.0"
-features = ["stm32f407"]
+stm32f4xx-hal = { version = "0.23.0", features = ["stm32f407"] }
 
 [profile.dev]
 opt-level = 1
