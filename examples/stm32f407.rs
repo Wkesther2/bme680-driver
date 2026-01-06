@@ -2,7 +2,8 @@
 //!
 //! This example demonstrates:
 //! 1. **Initialization**: Setting up I2C and the BME680 driver.
-//! 2. **Configuration**: Setting oversampling, filters, and gas heater profiles.
+//! 2. **Flexible Configuration**: Enabling or disabling specific measurements
+//!    (Temperature, Humidity, Pressure, Gas) to save power.
 //! 3. **Data Processing**: Reading measurements and manually formatting the
 //!    fixed-point data for logging.
 //! 4. **Dynamic Compensation**: Updating the gas heater profile based on the
@@ -53,25 +54,28 @@ fn main() -> ! {
         .expect("Failed to initialize BME680");
 
     // --- 3. Sensor Configuration ---
-    // Define a gas heater profile: Target 300°C with a 300ms heating duration
+    // Define a gas heater profile: Target 300°C with a 300ms heating duration.
+    // This allows detection of VOCs (Volatile Organic Compounds).
     let gas_profile0 = GasProfile {
         index: GasProfileIndex::Profile0,
         target_temp: Celsius(300),
         wait_time: Milliseconds(300),
     };
 
-    // Configure sensor oversampling settings (noise reduction vs. speed)
+    // Configure sensor oversampling settings.
+    // You can disable individual measurements by setting them to `Skipped`.
     let osrs_config = OversamplingConfig {
-        temp_osrs: Oversampling::X1,
-        hum_osrs: Oversampling::X1,
-        pres_osrs: Oversampling::X1,
+        temp_osrs: Oversampling::X1,      // Enable Temperature
+        hum_osrs: Oversampling::X1,       // Enable Humidity
+        pres_osrs: Oversampling::Skipped, // Disable Pressure (saves power/time)
     };
 
     // Assemble the full sensor configuration
     let mut config = Config {
         osrs_config,
         iir_filter: IIRFilter::IIR0,
-        gas_profile: gas_profile0,
+        // Pass `Some(profile)` to enable gas measurement, or `None` to disable it.
+        gas_profile: Some(gas_profile0),
         // Initial ambient temperature estimate for the heater algorithm
         ambient_temp: Celsius(2300), // 23.00 °C
     };
@@ -84,7 +88,8 @@ fn main() -> ! {
     // --- 4. Measurement Loop ---
     loop {
         // Trigger a measurement and wait for completion.
-        // This function handles the necessary delays for measurement and heating.
+        // This function automatically handles the varying delay times depending
+        // on which sensors (Gas/Pres/Hum) are enabled.
         let data = bme680
             .read_new_data(&mut delay)
             .expect("Failed to read data");
@@ -100,17 +105,25 @@ fn main() -> ! {
         // Log using defmt (or any other logging framework/UART)
         defmt::println!("Temperature:    {}.{} °C", temp.0, temp.1);
         defmt::println!("Humidity:       {}.{} %", hum.0, hum.1);
-        defmt::println!("Pressure:       {}.{} hPa", pres.0, pres.1);
-        defmt::println!("Gas Resistance: {}  Ohm", data.gas.0); // Raw value access
+
+        // Even if skipped, the driver returns a safe default (usually 0 or last value)
+        // or you can check configuration before printing.
+        defmt::println!("Pressure:       {}.{} hPa (Skipped)", pres.0, pres.1);
+
+        // Raw gas resistance access (higher resistance = cleaner air)
+        defmt::println!("Gas Resistance: {}  Ohm", data.gas.0);
         defmt::println!("");
 
         // --- Dynamic Heater Compensation ---
         // The gas sensor's heating plate resistance relies on the ambient temperature.
         // We update the profile using the just-measured temperature (`data.temp.0`)
         // to ensure the plate hits exactly 300°C in the next cycle.
-        bme680
-            .set_gas_heater_profile(gas_profile0, Celsius(data.temp.0))
-            .expect("Failed to update heater profile");
+
+        if let Some(profile) = config.gas_profile {
+            bme680
+                .set_gas_heater_profile(profile, Celsius(data.temp.0))
+                .expect("Failed to update heater profile");
+        }
 
         // Wait 5 seconds before the next measurement cycle
         delay.delay_ms(5000);
