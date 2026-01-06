@@ -23,6 +23,7 @@ A type-safe, `no_std` Rust driver for the **Bosch BME680** environmental sensor.
 
 ## Features
 
+- **Power Saving**: Individually enable/disable gas, pressure, temperature, or humidity measurements to reduce power consumption.
 - **Typestate Pattern**: Prevents illegal sensor states and ensures correct initialization.
 - **Fixed-Point Arithmetic**: High-performance compensation formulas without the need for a floating-point unit (FPU).
 - **Type-Safe Units**: Uses custom types like `Celsius` and `Milliseconds` to prevent unit-mixing errors.
@@ -37,7 +38,7 @@ A type-safe, `no_std` Rust driver for the **Bosch BME680** environmental sensor.
     ├── src/
     │   ├── lib.rs
     │   └── calc.rs
-    ├── .examples/
+    ├── examples/
     │   └── stm32f407.rs
     ├── .cargo/
     │   └── config.toml
@@ -52,7 +53,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bme680-driver = "0.1.0"
+bme680-driver = "0.2.0"
 ```
 
 ---
@@ -63,43 +64,55 @@ bme680-driver = "0.1.0"
 use bme680_driver::*;
 
 // Initialize I2C and Delay from your HAL...
+// let i2c = ...
+// let mut delay = ...
+
 let bme = Bme680::new(i2c, 0x76);
 let mut bme = bme.init(&mut delay).expect("Failed to init BME680");
 
 let mut config = Config {
     osrs_config: OversamplingConfig {
-        temp_osrs: Oversampling::X1,
+        temp_osrs: Oversampling::X2,
         hum_osrs: Oversampling::X1,
-        pres_osrs: Oversampling::X1,
+        // Example: Disable pressure measurement to save power and time
+        pres_osrs: Oversampling::Skipped,
     },
     iir_filter: IIRFilter::IIR0,
-    gas_profile: GasProfile {
+    // Enable gas measurement by providing a profile (wrap in Some)
+    gas_profile: Some(GasProfile {
         index: GasProfileIndex::Profile0,
         target_temp: Celsius(300),
         wait_time: Milliseconds(300),
-    },
-    ambient_temp: Celsius(2300),
+    }),
+    ambient_temp: Celsius(2300), // 23.00 °C initial guess
 };
 
 bme.configure_sensor(&mut config).unwrap();
 
 loop {
+    // Perform measurement (waits automatically for heating if enabled)
     let data = bme.read_new_data(&mut delay).unwrap();
     
     // Use helper methods to format data (no floats needed!)
-    let (temp_int, temp_frac) = data.temp.split();
-    let (pres_hpa, pres_dec) = data.pres.as_hpa();
+    let (temp_whole, temp_frac) = data.temp.split();
+    let (hum_whole, hum_frac) = data.hum.split();
     
     // Log formatted data (e.g., via defmt)
-    defmt::println!("Temperature:    {}.{} °C", temp.0, temp.1);
-    defmt::println!("Humidity:       {}.{} %", hum.0, hum.1);
-    defmt::println!("Pressure:       {}.{} hPa", pres.0, pres.1);
+    defmt::println!("Temperature:    {}.{} °C", temp_whole, temp_frac);
+    defmt::println!("Humidity:       {}.{} %", hum_whole, hum_frac);
     defmt::println!("Gas Resistance: {}  Ohm", data.gas.0);
+    
+    // Pressure was skipped, so it returns default/zero values
+    // defmt::println!("Pressure: Skipped"); 
+    
     defmt::println!("");
     
     // Dynamically update heater profile with current ambient temperature.
-    // We access the raw value (.0) to wrap it into Celsius.
-    bme.set_gas_heater_profile(config.gas_profile, Celsius(data.temp.0)).unwrap();
+    // We only do this if gas measurement is actually enabled.
+    if let Some(profile) = config.gas_profile {
+        // We access the raw value (.0) to wrap it into Celsius
+        bme.set_gas_heater_profile(profile, Celsius(data.temp.0)).unwrap();
+    }
     
     delay.delay_ms(5000);
 }

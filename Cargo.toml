@@ -1,6 +1,6 @@
 [package]
 name = "bme680-driver"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Gabriel Zuser <zusergabriel@gmail.com>"]
 edition = "2024"
 description = "A type-safe, no_std driver for the Bosch BME680 environmental sensor using embedded-hal"

@@ -1,4 +1,4 @@
-use crate::{Bme680, CalcTempData, Celsius, GasProfileIndex, Milliseconds, error, i2c};
+use crate::{Bme680, CalcTempData, Celsius, GasProfileIndex, Milliseconds, error, i2c, regs};
 
 /// Constants and lookup tables provided by Bosch for gas resistance compensation.
 mod gas_constants {
@@ -62,10 +62,13 @@ where
         let base_value = (wait_time.0 / (multiplicator as u32)) as u8;
 
         // The final byte format: [Multiplier Bits (7:6)][Base Value (5:0)]
-        let register_value = base_value + (multiplicator_bits << 0x6);
+        let register_value = base_value + (multiplicator_bits << 6);
 
         // Registers for heater duration start at 0x64 (gas_wait_0)
-        self.write_reg(&[0x64 + (profile_index as u8), register_value])?;
+        self.write_reg(&[
+            regs::ADDR_GAS_WAIT_0 + (profile_index as u8),
+            register_value,
+        ])?;
 
         Ok(())
     }
@@ -113,7 +116,7 @@ where
         let res_heat_x = ((res_heat_x100 + 50) / 100) as u8;
 
         // Registers for heater resistance start at 0x5A (res_heat_0)
-        self.write_reg(&[0x5A + (profile_index as u8), res_heat_x])?;
+        self.write_reg(&[regs::ADDR_RES_HEAT_0 + (profile_index as u8), res_heat_x])?;
 
         Ok(())
     }
@@ -169,7 +172,7 @@ where
         if press_comp >= (1 << 30) {
             press_comp = ((press_comp as u32).wrapping_div(var1 as u32) << 1) as i32;
         } else {
-            press_comp = ((press_comp << 1i32) as u32).wrapping_div(var1 as u32) as i32;
+            press_comp = ((press_comp << 1) as u32).wrapping_div(var1 as u32) as i32;
         }
 
         let var1 = ((self.calib_data.par_p9 as i32)

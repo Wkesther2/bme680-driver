@@ -66,7 +66,7 @@ fn main() -> ! {
     // You can disable individual measurements by setting them to `Skipped`.
     let osrs_config = OversamplingConfig {
         temp_osrs: Oversampling::X1,      // Enable Temperature
-        hum_osrs: Oversampling::X1,       // Enable Humidity
+        hum_osrs: Oversampling::X4,       // Enable Humidity
         pres_osrs: Oversampling::Skipped, // Disable Pressure (saves power/time)
     };
 

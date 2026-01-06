@@ -24,17 +24,57 @@ mod calc;
 use core::marker::PhantomData;
 use embedded_hal::{self, delay::DelayNs, i2c};
 
-/// Memory addresses and sizes for calibration data registers.
-mod calib_mem {
-    pub const ADDR: [u8; 2] = [0x89, 0xE1];
-    pub const SIZES: [usize; 2] = [25, 16];
-    pub const TOTAL_SIZE: usize = 25 + 16;
+/// Internal register addresses for the BME680.
+pub(crate) mod regs {
+    pub const ADDR_RES_HEAT_VAL: u8 = 0x00;
+    pub const ADDR_RES_HEAT_RANGE: u8 = 0x02;
+    pub const ADDR_RANGE_SW_ERR: u8 = 0x04;
+    /// Status register containing the "new data" bit.
+    pub const ADDR_EAS_STATUS_0: u8 = 0x1D;
+    /// Start of the measurement data registers (Pressure MSB).
+    pub const ADDR_PRESS_MSB: u8 = 0x1F;
+    pub const ADDR_RES_HEAT_0: u8 = 0x5A;
+    pub const ADDR_GAS_WAIT_0: u8 = 0x64;
+    /// Ctrl Gas 1: RUN_GAS and NB_CONV settings.
+    pub const ADDR_CTRL_GAS_1: u8 = 0x71;
+    /// Ctrl Hum: Humidity oversampling.
+    pub const ADDR_CTRL_HUM: u8 = 0x72;
+    /// Ctrl Meas: Temp/Pres oversampling and Mode selection.
+    pub const ADDR_CTRL_MEAS: u8 = 0x74;
+    /// Config: IIR Filter and SPI 3-wire selection.
+    pub const ADDR_CONFIG: u8 = 0x75;
+    /// Start of the first calibration data block.
+    pub const ADDR_CALIB_0: u8 = 0x89;
+    /// Chip ID register.
+    pub const ADDR_ID: u8 = 0xD0;
+    /// Soft Reset register.
+    pub const ADDR_RESET: u8 = 0xE0;
+    /// Start of the second calibration data block.
+    pub const ADDR_CALIB_1: u8 = 0xE1;
 }
 
-/// Memory address and size for the measurement data registers.
-mod raw_data_mem {
-    pub const ADDR: u8 = 0x1F;
-    pub const SIZE: usize = 12;
+/// Sizes of various data blocks in memory.
+mod reg_sizes {
+    pub const SIZE_CALIB_0: usize = 25;
+    pub const SIZE_CALIB_1: usize = 16;
+    pub const SIZE_CALIB_TOTAL: usize = SIZE_CALIB_0 + SIZE_CALIB_1;
+    pub const SIZE_RAW_DATA: usize = 13;
+}
+
+/// Bit masks for register configuration.
+mod msks {
+    /// Command to trigger a soft reset.
+    pub const MSK_RESET: u8 = 0xB6;
+    pub const MSK_RES_HEAT_RANGE: u8 = 0x30;
+    pub const MSK_NB_CONV: u8 = 0xF;
+    pub const MSK_PAR_H1_LSB: u8 = 0xF;
+    pub const MSK_GAS_RANGE: u8 = 0x0F;
+    pub const MSK_OSRS_P: u8 = 0x1C;
+    pub const MSK_OSRS_T: u8 = 0xE0;
+    pub const MSK_OSRS_H: u8 = 0x3;
+    pub const MSK_RUN_GAS: u8 = 0x10;
+    pub const MSK_MODE: u8 = 0x3;
+    pub const MSK_FILTER: u8 = 0x1C;
 }
 
 // --- Typestates ---
@@ -181,6 +221,9 @@ impl OversamplingConfig {
 }
 
 /// Internal struct to track which sensors are enabled for the current measurement cycle.
+///
+/// This is derived from the register settings before a measurement starts
+/// to determine if we need to wait for the gas heater or skip calculation steps.
 struct MeasConfig {
     osrs_config: OversamplingConfig,
     gas_enabled: bool,
@@ -188,19 +231,27 @@ struct MeasConfig {
 
 /// Complete sensor configuration used for setup.
 pub struct Config {
-    /// Oversampling settings for T, P, H.
+    /// Oversampling settings for Temperature, Pressure, and Humidity.
     pub osrs_config: OversamplingConfig,
-    /// IIR Filter settings.
+    /// IIR Filter settings to reduce noise in T and P measurements.
     pub iir_filter: IIRFilter,
     /// Gas heater configuration.
-    /// Set to `None` to disable gas measurement entirely (saves significant power).
+    ///
+    /// Set to `None` to disable gas measurement entirely. This saves significant
+    /// power (~12-18mA) and time, as the heating phase is skipped.
     pub gas_profile: Option<GasProfile>,
-    /// Current ambient temperature estimate (required for heater resistance calculation).
+    /// Current ambient temperature estimate (in °C * 100).
+    ///
+    /// This is required for the heater resistance calculation formula to ensure
+    /// the target temperature (e.g., 300°C) is reached accurately.
     pub ambient_temp: Celsius,
 }
 
 /// Factory-fused calibration coefficients read from the sensor.
-/// These are unique to every individual chip and required for compensation formulas.
+///
+/// These parameters are unique to every individual chip and are read from
+/// non-volatile memory during initialization (`init()`). They are required
+/// to compensate the raw ADC values into physical units.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct CalibData {
     pub par_h1: u16,
@@ -233,8 +284,8 @@ pub struct CalibData {
 
 /// Raw ADC output and status bits read directly from the sensor registers.
 ///
-/// This struct holds the uncompensated data. It is used internally by the driver
-/// to calculate the final physical values using the calibration parameters.
+/// This struct holds the uncompensated data read from `regs::ADDR_PRESS_MSB` onwards.
+/// It is used internally by the driver to calculate the final physical values.
 #[derive(Debug, Copy, Clone)]
 pub struct RawData {
     pub(crate) temp_adc: u32,
@@ -251,8 +302,8 @@ pub struct RawData {
 
 /// Intermediate temperature values used for compensation.
 ///
-/// These values are calculated during temperature compensation and are required
-/// for the subsequent pressure and humidity compensation formulas (t_fine).
+/// These values (`t_fine`) are calculated during temperature compensation and
+/// are required for the subsequent pressure and humidity compensation formulas.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct CalcTempData {
     pub(crate) temp_fine: i32,
@@ -345,7 +396,7 @@ pub struct Gas(pub u32);
 /// Compensated measurement result in physical units.
 ///
 /// All fields use strong types (`Temperature`, `Humidity`, etc.) to prevent unit confusion.
-/// If a measurement was skipped/disabled, the corresponding field may contain 0 or a stale value.
+/// If a measurement was skipped/disabled, the corresponding field contains `0` (Default).
 #[derive(Debug, Copy, Clone, Default)]
 pub struct Measurement {
     /// Temperature data.
@@ -403,9 +454,7 @@ where
     /// This resets all internal registers to their default values.
     /// A delay of at least 2ms is required after the reset command.
     fn reset(&mut self, delay: &mut impl DelayNs) -> error::Result<(), E> {
-        self.i2c
-            .write(self.address, &[0xE0, 0xB6])
-            .map_err(|e| error::Bme680Error::I2CError(e))?;
+        self.write_reg(&[regs::ADDR_RESET, msks::MSK_RESET])?;
 
         delay.delay_ms(2);
 
@@ -475,12 +524,12 @@ where
     /// These bytes are required to compensate the raw ADC values into physical units.
     fn get_calib_data(&mut self) -> error::Result<CalibData, E> {
         let mut calib_data = CalibData::default();
-        let mut buffer = [0u8; calib_mem::TOTAL_SIZE];
+        let mut buffer = [0u8; reg_sizes::SIZE_CALIB_TOTAL];
 
         // 1. Read first block (0x89..0xA0)
-        self.read_into(calib_mem::ADDR[0], &mut buffer[0..calib_mem::SIZES[0]])?;
+        self.read_into(regs::ADDR_CALIB_0, &mut buffer[0..reg_sizes::SIZE_CALIB_0])?;
         // 2. Read second block (0xE1..0xF0)
-        self.read_into(calib_mem::ADDR[1], &mut buffer[calib_mem::SIZES[0]..])?;
+        self.read_into(regs::ADDR_CALIB_1, &mut buffer[reg_sizes::SIZE_CALIB_0..])?;
 
         // Mapping raw buffer bytes to compensation parameters (Bosch proprietary logic)
         // See BME680 datasheet, Section 3.11.1
@@ -497,7 +546,10 @@ where
         calib_data.par_p8 = ((buffer[19] as i32) | ((buffer[20] as i32) << 8)) as i16;
         calib_data.par_p9 = ((buffer[21] as i32) | ((buffer[22] as i32) << 8)) as i16;
         calib_data.par_p10 = buffer[23];
-        calib_data.par_h1 = (((buffer[26] & 0x0F) as i32) | ((buffer[27] as i32) << 4)) as u16;
+
+        // Use mask constant for bitwise operations
+        calib_data.par_h1 =
+            (((buffer[26] & msks::MSK_PAR_H1_LSB) as i32) | ((buffer[27] as i32) << 4)) as u16;
         calib_data.par_h2 = (((buffer[26] >> 4) as i32) | ((buffer[25] as i32) << 4)) as u16;
         calib_data.par_h3 = buffer[28] as i8;
         calib_data.par_h4 = buffer[29] as i8;
@@ -509,9 +561,13 @@ where
         calib_data.par_g3 = buffer[38] as i8;
 
         // Additional heater-specific calibration values
-        calib_data.res_heat_val = self.read_reg_byte(0x00)?;
-        calib_data.res_heat_range = (self.read_reg_byte(0x02)? >> 4) & 0x03;
-        calib_data.range_sw_err = (self.read_reg_byte(0x04)? as i8) >> 4;
+        calib_data.res_heat_val = self.read_reg_byte(regs::ADDR_RES_HEAT_VAL)?;
+
+        // Use mask for range reading (Bits 4,5)
+        calib_data.res_heat_range =
+            (self.read_reg_byte(regs::ADDR_RES_HEAT_RANGE)? & msks::MSK_RES_HEAT_RANGE) >> 4;
+
+        calib_data.range_sw_err = (self.read_reg_byte(regs::ADDR_RANGE_SW_ERR)? as i8) >> 4;
 
         Ok(calib_data)
     }
@@ -566,7 +622,7 @@ where
         let meas_config = self.get_meas_config()?;
 
         // Optimization: Don't trigger a measurement if nothing is enabled.
-        if meas_config.gas_enabled == false && meas_config.osrs_config.is_all_skipped() {
+        if !meas_config.gas_enabled && meas_config.osrs_config.is_all_skipped() {
             return Ok(Measurement::default());
         }
 
@@ -622,42 +678,45 @@ where
 
     /// Reads the Chip ID from the sensor (expected value: 0x61).
     pub fn read_chip_id(&mut self) -> error::Result<u8, E> {
-        Ok(self.read_reg_byte(0xD0)?)
+        Ok(self.read_reg_byte(regs::ADDR_ID)?)
     }
 
     /// Selects one of the 10 available gas heater profiles.
     pub fn select_gas_profile(&mut self, profile: &GasProfile) -> error::Result<(), E> {
         self.current_wait_time = profile.wait_time;
-        let register = self.read_reg_byte(0x71)?;
-        // Update bits [3:0] (nb_conv)
-        self.write_reg(&[0x71, (register & 0xF0) | (profile.index as u8)])?;
+        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+
+        // Clear NB_CONV bits using mask, then set new profile index
+        self.write_reg(&[
+            regs::ADDR_CTRL_GAS_1,
+            (register & !msks::MSK_NB_CONV) | (profile.index as u8),
+        ])?;
         Ok(())
     }
 
     /// Polls the sensor until new data is available and reads all ADC values.
     ///
-    /// This method includes a timeout mechanism (approx. 5ms).
+    /// This method includes a timeout mechanism (max. 50ms).
     fn get_raw_data(&mut self, delay: &mut impl DelayNs) -> error::Result<RawData, E> {
         let mut new_data = false;
-        let mut timeout_us = 5000; // 5ms Timeout
+        let mut timeout_us = 50000; // 50ms Timeout
 
         while !new_data {
             if timeout_us <= 0 {
                 return Err(error::Bme680Error::Timeout);
             }
-            // Check bit 7 in register 0x1D (new_data_0)
-            new_data = (self.read_reg_byte(0x1D)? >> 7) != 0;
+            // Check bit 7 (MSB) in EAS_STATUS_0 register
+            // Note: 0x80 is implied for Bit 7, or we could add MSK_NEW_DATA later
+            new_data = (self.read_reg_byte(regs::ADDR_EAS_STATUS_0)? >> 7) != 0;
 
             delay.delay_us(500);
             timeout_us -= 500;
         }
 
-        let mut buffer = [0u8; raw_data_mem::SIZE + 1];
+        let mut buffer = [0u8; reg_sizes::SIZE_RAW_DATA];
 
-        // Burst read starting from 0x1F (pressure MSB)
-        self.i2c
-            .write_read(self.address, &[raw_data_mem::ADDR], &mut buffer)
-            .map_err(|e| error::Bme680Error::I2CError(e))?;
+        // Burst read starting from ADDR_PRESS_MSB Register
+        self.read_into(regs::ADDR_PRESS_MSB, &mut buffer)?;
 
         // Reconstruct 20-bit and 16-bit ADC values from register bytes
         let press_adc =
@@ -666,7 +725,9 @@ where
             ((buffer[5] as u32) >> 4) | ((buffer[4] as u32) << 4) | ((buffer[3] as u32) << 12);
         let hum_adc = ((buffer[7] as u32) | ((buffer[6] as u32) << 8)) as u16;
         let gas_adc = (((buffer[12] as u32) >> 6) | ((buffer[11] as u32) << 2)) as u16;
-        let gas_range = buffer[12] & 0x0F;
+
+        // Use mask for gas range
+        let gas_range = buffer[12] & msks::MSK_GAS_RANGE;
 
         // Status bits for gas measurement
         let gas_valid_r = ((buffer[12] >> 5) & 0x1) != 0;
@@ -685,43 +746,54 @@ where
 
     /// Sets oversampling rates for Humidity, Temperature, and Pressure.
     ///
-    /// Writes to registers `ctrl_hum` (0x72) and `ctrl_meas` (0x74).
+    /// Writes to registers CTRL_HUM and CTRL_MEAS.
     fn config_oversampling(&mut self, osrs_config: &OversamplingConfig) -> error::Result<(), E> {
         // Humidity configuration (Register 0x72)
-        let register = self.read_reg_byte(0x72)?;
-        let mut new_reg_val = (register & 0xF8) | osrs_config.hum_osrs as u8;
-        self.write_reg(&[0x72, new_reg_val])?;
+        // We must read first to preserve other bits if they existed (though CTRL_HUM usually only has SPI bit)
+        let ctrl_hum = self.read_reg_byte(regs::ADDR_CTRL_HUM)?;
+        let new_hum = (ctrl_hum & !msks::MSK_OSRS_H) | osrs_config.hum_osrs as u8;
+        self.write_reg(&[regs::ADDR_CTRL_HUM, new_hum])?;
 
         // Temperature & Pressure configuration (Register 0x74)
-        let register = self.read_reg_byte(0x74)?;
+        let ctrl_meas = self.read_reg_byte(regs::ADDR_CTRL_MEAS)?;
+
+        // Prepare new bits
         let temp_pres_combined =
-            ((osrs_config.temp_osrs as u8) << 0x5) | ((osrs_config.pres_osrs as u8) << 0x2);
-        new_reg_val = (register & 0x03) | temp_pres_combined;
-        self.write_reg(&[0x74, new_reg_val])?;
+            ((osrs_config.temp_osrs as u8) << 5) | ((osrs_config.pres_osrs as u8) << 2);
+
+        // Clear old bits (Using !Mask) and set new ones
+        let new_meas = (ctrl_meas & !(msks::MSK_OSRS_T | msks::MSK_OSRS_P)) | temp_pres_combined;
+
+        self.write_reg(&[regs::ADDR_CTRL_MEAS, new_meas])?;
 
         Ok(())
     }
 
     /// Configures the IIR filter coefficient.
     fn config_iir_filter(&mut self, iir_filter: IIRFilter) -> error::Result<(), E> {
-        let register = self.read_reg_byte(0x75)?;
-        let new_reg_val = (register & 0xE3) | ((iir_filter as u8) << 0x2);
-        self.write_reg(&[0x75, new_reg_val])?;
+        let register = self.read_reg_byte(regs::ADDR_CONFIG)?;
+        // Clear filter bits and set new value
+        let new_reg_val = (register & !msks::MSK_FILTER) | ((iir_filter as u8) << 2);
+        self.write_reg(&[regs::ADDR_CONFIG, new_reg_val])?;
         Ok(())
     }
 
-    /// Enables the gas sensing functionality in the sensor (ctrl_gas_1).
+    /// Enables the gas sensing functionality in the sensor (CTRL_GAS_1).
     fn enable_gas_measurement(&mut self) -> error::Result<(), E> {
-        let register = self.read_reg_byte(0x71)?;
-        // Bit 4: run_gas
-        self.write_reg(&[0x71, (register & 0xEF) | (0b1 << 4)])?;
+        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+        // Set RUN_GAS bit (Bit 4)
+        self.write_reg(&[
+            regs::ADDR_CTRL_GAS_1,
+            (register & !msks::MSK_RUN_GAS) | msks::MSK_RUN_GAS,
+        ])?;
         Ok(())
     }
 
     /// Disables the gas sensing functionality in the sensor.
     fn disable_gas_measurement(&mut self) -> error::Result<(), E> {
-        let register = self.read_reg_byte(0x71)?;
-        self.write_reg(&[0x71, register & 0xEF])?;
+        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+        // Clear RUN_GAS bit (Bit 4)
+        self.write_reg(&[regs::ADDR_CTRL_GAS_1, register & !msks::MSK_RUN_GAS])?;
         Ok(())
     }
 
@@ -729,9 +801,9 @@ where
     ///
     /// The sensor returns to Sleep mode automatically after the measurement.
     fn activate_forced_mode(&mut self) -> error::Result<(), E> {
-        let register = self.read_reg_byte(0x74)?;
-        // Mode 01: Forced mode
-        self.write_reg(&[0x74, (register & 0xFC) | 0b01])?;
+        let register = self.read_reg_byte(regs::ADDR_CTRL_MEAS)?;
+        // Clear Mode bits and set to 01 (Forced)
+        self.write_reg(&[regs::ADDR_CTRL_MEAS, (register & !msks::MSK_MODE) | 0b01])?;
         Ok(())
     }
 
@@ -741,13 +813,21 @@ where
     fn get_meas_config(&mut self) -> error::Result<MeasConfig, E> {
         let mut buffer = [0u8; 4];
 
-        // Burst read starting from 0x71 (ctrl_gas_1)
-        self.read_into(0x71, &mut buffer)?;
+        // Burst read starting from CTRL_GAS_1 register
+        self.read_into(regs::ADDR_CTRL_GAS_1, &mut buffer)?;
 
-        let gas_enabled = ((buffer[0] >> 4) & 0x1) != 0;
-        let osrs_h = buffer[1] & 0x7;
-        let osrs_p = (buffer[3] >> 2) & 0x3;
-        let osrs_t = (buffer[3] >> 5) & 0x3;
+        // Extract values using masks (AND logic)
+        // Bit 4 of byte 0
+        let gas_enabled = (buffer[0] & msks::MSK_RUN_GAS) != 0;
+
+        // Bits 0-2 of byte 1
+        let osrs_h = buffer[1] & msks::MSK_OSRS_H;
+
+        // Bits 2-4 of byte 3 (CTRL_MEAS is buffer[3] relative to CTRL_GAS_1)
+        let osrs_p = (buffer[3] & msks::MSK_OSRS_P) >> 2;
+
+        // Bits 5-7 of byte 3
+        let osrs_t = (buffer[3] & msks::MSK_OSRS_T) >> 5;
 
         let osrs_config = OversamplingConfig {
             temp_osrs: Oversampling::from_u8(osrs_t),
