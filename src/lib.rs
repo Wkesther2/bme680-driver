@@ -3,57 +3,68 @@
 
 //! # BME680 Environmental Sensor Driver
 //!
-//! A type-safe, `no_std` driver for the Bosch BME680.
-//! This driver uses the typestate pattern to ensure the sensor is correctly
-//! initialized and configured before measurements are taken.
+//! A type-safe, `no_std` driver for the Bosch BME680 environmental sensor.
+//! This driver is designed for high-reliability embedded applications where
+//! floating-point arithmetic is either unavailable or too slow.
 //!
-//! ## Features
-//! - **Flexible Configuration**: Individually enable/disable Temperature, Humidity,
-//!   Pressure, or Gas measurements to save power.
-//! - **Fixed-Point Arithmetic**: No FPU required.
-//! - **Typestate Pattern**: Prevents measuring before initialization.
+//! ## Key Features
 //!
-//! ## Units
-//! - **Temperature**: Centigrade (C * 100) -> 2350 = 23.50 °C
-//! - **Humidity**: Milli-percent (RH % * 1000) -> 45123 = 45.123 %
-//! - **Pressure**: Pascal (Pa) -> 101325 = 1013.25 hPa
-//! - **Gas Resistance**: Ohms (Ω)
+//! - **Typestate Architecture**: The driver uses a compile-time state machine (`Uninitialized` -> `Ready`)
+//!   to ensure methods like `read_new_data` cannot be called before the sensor is properly set up.
+//! - **Fixed-Point Arithmetic**: All calculations (Temperature, Pressure, Humidity, Gas) are performed
+//!   using integer arithmetic. This ensures deterministic behavior and high performance on Cortex-M0/M3/M4 cores.
+//! - **Power Efficiency**: The driver supports granular control over which measurements are enabled
+//!   (e.g., disabling Gas or Pressure sensing to save energy).
+//!
+//! ## Data Units
+//!
+//! To avoid floats, this driver uses scaled integer units:
+//!
+//! - **Temperature**: Centigrade (`°C * 100`). Example: `2350` = 23.50 °C.
+//! - **Humidity**: Milli-percent (`%rH * 1000`). Example: `45123` = 45.123 %rH.
+//! - **Pressure**: Pascal (`Pa`). Example: `101325` = 1013.25 hPa.
+//! - **Gas Resistance**: Ohms (`Ω`). Higher values typically indicate cleaner air.
 
 mod calc;
+pub mod settings;
 
 use core::marker::PhantomData;
 use embedded_hal::{self, delay::DelayNs, i2c};
 
+pub use settings::{BME680Builder, Config, GasProfile, GasProfileIndex, IIRFilter, Oversampling};
+
 /// Internal register addresses for the BME680.
+///
+/// These addresses are derived from the Bosch BME680 Datasheet.
 pub(crate) mod regs {
     pub const ADDR_RES_HEAT_VAL: u8 = 0x00;
     pub const ADDR_RES_HEAT_RANGE: u8 = 0x02;
     pub const ADDR_RANGE_SW_ERR: u8 = 0x04;
-    /// Status register containing the "new data" bit.
+    /// Status register containing the "New Data" bit (Bit 7) and "Measuring" bit (Bit 6).
     pub const ADDR_EAS_STATUS_0: u8 = 0x1D;
     /// Start of the measurement data registers (Pressure MSB).
     pub const ADDR_PRESS_MSB: u8 = 0x1F;
     pub const ADDR_RES_HEAT_0: u8 = 0x5A;
     pub const ADDR_GAS_WAIT_0: u8 = 0x64;
-    /// Ctrl Gas 1: RUN_GAS and NB_CONV settings.
+    /// Ctrl Gas 1: Controls RUN_GAS (Bit 4) and NB_CONV (Bits 0-3).
     pub const ADDR_CTRL_GAS_1: u8 = 0x71;
-    /// Ctrl Hum: Humidity oversampling.
+    /// Ctrl Hum: Controls Humidity oversampling (Bits 0-2).
     pub const ADDR_CTRL_HUM: u8 = 0x72;
-    /// Ctrl Meas: Temp/Pres oversampling and Mode selection.
+    /// Ctrl Meas: Controls Temp/Pres oversampling and Mode selection (Sleep/Forced).
     pub const ADDR_CTRL_MEAS: u8 = 0x74;
-    /// Config: IIR Filter and SPI 3-wire selection.
+    /// Config: IIR Filter settings and SPI 3-wire selection.
     pub const ADDR_CONFIG: u8 = 0x75;
-    /// Start of the first calibration data block.
+    /// Start of the first calibration data block (0x89 - 0xA1).
     pub const ADDR_CALIB_0: u8 = 0x89;
-    /// Chip ID register.
+    /// Chip ID register (should read 0x61).
     pub const ADDR_ID: u8 = 0xD0;
-    /// Soft Reset register.
+    /// Soft Reset register (write 0xB6 to reset).
     pub const ADDR_RESET: u8 = 0xE0;
-    /// Start of the second calibration data block.
+    /// Start of the second calibration data block (0xE1 - 0xF0).
     pub const ADDR_CALIB_1: u8 = 0xE1;
 }
 
-/// Sizes of various data blocks in memory.
+/// Sizes of various data blocks in memory for burst reads.
 mod reg_sizes {
     pub const SIZE_CALIB_0: usize = 25;
     pub const SIZE_CALIB_1: usize = 16;
@@ -61,7 +72,7 @@ mod reg_sizes {
     pub const SIZE_RAW_DATA: usize = 13;
 }
 
-/// Bit masks for register configuration.
+/// Bit masks for register configuration and bitwise operations.
 mod msks {
     /// Command to trigger a soft reset.
     pub const MSK_RESET: u8 = 0xB6;
@@ -79,179 +90,75 @@ mod msks {
 
 // --- Typestates ---
 
+/// Initial state of the driver. No logical connection established yet.
 pub struct Idle;
-/// Sensor has been created but not yet initialized with calibration data.
+/// Sensor instance created, but hardware not yet initialized (calibration data missing).
 pub struct Uninitialized;
-/// Sensor is initialized, configured, and ready for measurements.
+/// Sensor is fully initialized, calibrated, and ready for measurements.
 pub struct Ready;
 
 /// Error types for the BME680 driver.
 pub mod error {
-    /// Errors that can occur during communication or configuration.
+    /// Errors that can occur during communication, configuration, or measurement.
     #[derive(Debug, Clone, Copy)]
-    pub enum Bme680Error<E> {
-        /// I2C bus error.
-        I2CError(E),
-        /// Provided wait time exceeds the 4096ms hardware limit.
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    pub enum Bme680Error {
+        /// Underlying I2C bus error.
+        I2CError,
+        /// Provided wait time exceeds the 4096ms hardware limit of the sensor.
         InvalidWaitTime,
-        /// Provided profile index is out of bounds (0-9).
+        /// Provided profile index is out of bounds (valid range: 0-9).
         InvalidProfileIndex,
-        /// Sensor measurement timed out.
+        /// Sensor did not complete measurement within the expected time window.
         Timeout,
-        /// Gas heating plate has not reached a stable temperature.
+        /// Gas heating plate did not reach the target temperature (check power supply).
         HeaterNotStable,
-        /// Gas measurement data is not yet valid.
+        /// Gas measurement completed, but data is marked as invalid by the sensor.
         GasDataNotReady,
     }
 
     /// Result type alias for BME680 operations.
-    pub type Result<T, E> = core::result::Result<T, Bme680Error<E>>;
-}
-
-/// Oversampling settings for Temperature, Pressure, and Humidity.
-///
-/// Higher oversampling rates increase accuracy (reduce noise) but lead to
-/// longer measurement times and higher power consumption.
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-pub enum Oversampling {
-    /// No measurement performed. Used to disable a specific sensor.
-    Skipped = 0,
-    /// 1x Oversampling.
-    X1 = 1,
-    /// 2x Oversampling.
-    X2 = 2,
-    /// 4x Oversampling.
-    X4 = 3,
-    /// 8x Oversampling.
-    X8 = 4,
-    /// 16x Oversampling.
-    X16 = 5,
-}
-
-impl Oversampling {
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Oversampling::Skipped,
-            1 => Oversampling::X1,
-            2 => Oversampling::X2,
-            3 => Oversampling::X4,
-            4 => Oversampling::X8,
-            5 => Oversampling::X16,
-            _ => panic!("Invalid Oversampling Value"),
-        }
-    }
-}
-
-/// Infinite Impulse Response (IIR) filter coefficient.
-///
-/// Used to filter short-term disturbances (noise) in pressure and temperature.
-/// Does not affect humidity or gas measurements.
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum IIRFilter {
-    IIR0 = 0,
-    IIR1 = 1,
-    IIR3 = 2,
-    IIR7 = 3,
-    IIR15 = 4,
-    IIR31 = 5,
-    IIR63 = 6,
-    IIR127 = 7,
-}
-
-/// Available heating profile slots (0 to 9) stored in the sensor.
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum GasProfileIndex {
-    Profile0 = 0,
-    Profile1 = 1,
-    Profile2 = 2,
-    Profile3 = 3,
-    Profile4 = 4,
-    Profile5 = 5,
-    Profile6 = 6,
-    Profile7 = 7,
-    Profile8 = 8,
-    Profile9 = 9,
+    pub type Result<T> = core::result::Result<T, Bme680Error>;
 }
 
 /// Temperature wrapper for type-safety.
-/// Value is stored in Centigrade * 100 (e.g., 2350 = 23.50 °C).
-#[derive(Clone, Copy)]
+///
+/// **Unit:** Centigrade * 100.
+///
+/// # Example
+/// `Celsius(2350)` represents **23.50 °C**.
+#[derive(Default, Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Celsius(pub i32);
 
-/// Duration wrapper for type-safety. Stored in milliseconds.
-#[derive(Debug, Clone, Copy)]
-pub struct Milliseconds(pub u32);
-
-/// Configuration for the gas sensor heating plate.
-#[derive(Clone, Copy)]
-pub struct GasProfile {
-    /// Slot index in the sensor memory where this profile is stored.
-    pub index: GasProfileIndex,
-    /// Target temperature in Celsius.
-    pub target_temp: Celsius,
-    /// Duration to maintain the temperature before measurement.
-    pub wait_time: Milliseconds,
-}
-
-/// Grouped oversampling settings for all three environmental sensors.
-///
-/// Use `Oversampling::Skipped` to disable specific measurements.
-pub struct OversamplingConfig {
-    /// Temperature oversampling.
-    pub temp_osrs: Oversampling,
-    /// Humidity oversampling.
-    pub hum_osrs: Oversampling,
-    /// Pressure oversampling.
-    pub pres_osrs: Oversampling,
-}
-
-impl OversamplingConfig {
-    /// Returns `true` if all measurements are set to `Skipped`.
+impl Celsius {
+    /// Splits the fixed-point value into integral (degrees) and fractional (decimals) parts.
     ///
-    /// This is used internally to determine if a forced measurement command
-    /// needs to be sent or if the sensor should remain idle.
-    pub fn is_all_skipped(&self) -> bool {
-        self.temp_osrs == Oversampling::Skipped
-            && self.hum_osrs == Oversampling::Skipped
-            && self.pres_osrs == Oversampling::Skipped
+    /// Useful for logging or displaying data without converting to `f32`.
+    ///
+    /// # Returns
+    /// A tuple `(whole, fraction)`.
+    ///
+    /// # Example
+    /// ```rust
+    /// use bme680_driver::Celsius;
+    /// let temp = Celsius(2350);
+    /// assert_eq!(temp.split(), (23, 50)); // Represents 23.50 °C
+    /// ```
+    pub fn split(&self) -> (i32, i32) {
+        (self.0 / 100, self.0 % 100)
     }
 }
 
-/// Internal struct to track which sensors are enabled for the current measurement cycle.
-///
-/// This is derived from the register settings before a measurement starts
-/// to determine if we need to wait for the gas heater or skip calculation steps.
-struct MeasConfig {
-    osrs_config: OversamplingConfig,
-    gas_enabled: bool,
-}
-
-/// Complete sensor configuration used for setup.
-pub struct Config {
-    /// Oversampling settings for Temperature, Pressure, and Humidity.
-    pub osrs_config: OversamplingConfig,
-    /// IIR Filter settings to reduce noise in T and P measurements.
-    pub iir_filter: IIRFilter,
-    /// Gas heater configuration.
-    ///
-    /// Set to `None` to disable gas measurement entirely. This saves significant
-    /// power (~12-18mA) and time, as the heating phase is skipped.
-    pub gas_profile: Option<GasProfile>,
-    /// Current ambient temperature estimate (in °C * 100).
-    ///
-    /// This is required for the heater resistance calculation formula to ensure
-    /// the target temperature (e.g., 300°C) is reached accurately.
-    pub ambient_temp: Celsius,
-}
+/// Duration wrapper for type-safety. Stored in milliseconds.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct Milliseconds(pub u32);
 
 /// Factory-fused calibration coefficients read from the sensor.
 ///
 /// These parameters are unique to every individual chip and are read from
-/// non-volatile memory during initialization (`init()`). They are required
-/// to compensate the raw ADC values into physical units.
+/// non-volatile memory during `init()`. They are strictly required to compensate
+/// the raw ADC values into physical units.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct CalibData {
     pub par_h1: u16,
@@ -285,7 +192,7 @@ pub struct CalibData {
 /// Raw ADC output and status bits read directly from the sensor registers.
 ///
 /// This struct holds the uncompensated data read from `regs::ADDR_PRESS_MSB` onwards.
-/// It is used internally by the driver to calculate the final physical values.
+/// It is used internally by the driver as input for the compensation formulas.
 #[derive(Debug, Copy, Clone)]
 pub struct RawData {
     pub(crate) temp_adc: u32,
@@ -294,54 +201,31 @@ pub struct RawData {
     pub(crate) gas_adc: u16,
     /// Range switching error used for gas calculation.
     pub(crate) gas_range: u8,
-    /// Indicates if the gas measurement is valid.
+    /// Flag: `true` if gas measurement is valid.
     pub(crate) gas_valid_r: bool,
-    /// Indicates if the target heater temperature was reached.
+    /// Flag: `true` if the target heater temperature was reached.
     pub(crate) heat_stab_r: bool,
 }
 
 /// Intermediate temperature values used for compensation.
 ///
-/// These values (`t_fine`) are calculated during temperature compensation and
-/// are required for the subsequent pressure and humidity compensation formulas.
+/// `temp_fine` is a high-resolution temperature value calculated during temperature
+/// compensation. It is carried over to pressure and humidity compensation formulas
+/// to account for temperature dependencies.
 #[derive(Debug, Copy, Clone, Default)]
 pub struct CalcTempData {
     pub(crate) temp_fine: i32,
     pub(crate) temp_comp: i32,
 }
 
-/// Represents temperature in Centigrade (degrees Celsius * 100).
+/// Represents relative humidity.
 ///
-/// This wrapper ensures type safety and prevents mixing units.
-/// Use the `.split()` method to easily format this for display.
-///
-/// # Example
-/// A value of `2350` represents **23.50 °C**.
-#[derive(Debug, Copy, Clone, Default)]
-pub struct Temperature(pub i32);
-
-impl Temperature {
-    /// Splits the fixed-point value into integral (degrees) and fractional (decimals) parts.
-    ///
-    /// # Returns
-    /// A tuple `(whole, fraction)`.
-    ///
-    /// # Example
-    /// ```rust
-    /// use bme680_driver::Temperature;
-    /// let temp = Temperature(2350);
-    /// assert_eq!(temp.split(), (23, 50)); // Represents 23.50 °C
-    /// ```
-    pub fn split(&self) -> (i32, i32) {
-        (self.0 / 100, self.0 % 100)
-    }
-}
-
-/// Represents relative humidity in milli-percent (percent * 1000).
+/// **Unit:** Milli-percent (percent * 1000).
 ///
 /// # Example
-/// A value of `45123` represents **45.123 %rH**.
+/// `Humidity(45123)` represents **45.123 %rH**.
 #[derive(Debug, Copy, Clone, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Humidity(pub i32);
 
 impl Humidity {
@@ -361,11 +245,14 @@ impl Humidity {
     }
 }
 
-/// Represents atmospheric pressure in Pascal (Pa).
+/// Represents atmospheric pressure.
+///
+/// **Unit:** Pascal (Pa).
 ///
 /// # Example
-/// A value of `101325` represents **101325 Pa** (or 1013.25 hPa).
+/// `Pressure(101325)` represents **101325 Pa** (or 1013.25 hPa).
 #[derive(Debug, Copy, Clone, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Pressure(pub u32);
 
 impl Pressure {
@@ -387,49 +274,54 @@ impl Pressure {
     }
 }
 
-/// Represents gas resistance in Ohms (Ω).
+/// Represents gas resistance.
+///
+/// **Unit:** Ohms (Ω).
 ///
 /// A higher gas resistance typically indicates cleaner air (fewer VOCs).
+/// A drastic drop in resistance usually indicates the presence of VOCs.
 #[derive(Debug, Copy, Clone, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Gas(pub u32);
 
 /// Compensated measurement result in physical units.
 ///
 /// All fields use strong types (`Temperature`, `Humidity`, etc.) to prevent unit confusion.
-/// If a measurement was skipped/disabled, the corresponding field contains `0` (Default).
+/// If a measurement was disabled in the `Config`, the corresponding field will contain `0`.
 #[derive(Debug, Copy, Clone, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Measurement {
-    /// Temperature data.
-    pub temp: Temperature,
-    /// Humidity data.
+    /// Compensated temperature.
+    pub temp: Celsius,
+    /// Compensated relative humidity.
     pub hum: Humidity,
-    /// Atmospheric pressure data.
+    /// Compensated atmospheric pressure.
     pub pres: Pressure,
-    /// Gas resistance data.
+    /// Compensated gas resistance.
     pub gas: Gas,
 }
 
 /// The main BME680 driver structure.
 ///
-/// Use `Bme680::new(...)` to start. The `STATE` generic uses the Typestate pattern
-/// to track initialization status at compile time.
+/// Use `Bme680::new(...)` or `Bme680::with_config(...)` to start.
+/// The `STATE` generic uses the Typestate pattern to track initialization status
+/// at compile time, preventing invalid API calls.
 #[derive(Debug, Copy, Clone)]
 pub struct Bme680<I2C, STATE> {
     i2c: I2C,
     address: u8,
     pub(crate) calib_data: CalibData,
-    /// Tracks the calculated wait time required for the current configuration.
-    current_wait_time: Milliseconds,
+    config: Config,
     _state: PhantomData<STATE>,
 }
 
-impl<I2C, E> Bme680<I2C, Idle>
+impl<I2C> Bme680<I2C, Idle>
 where
-    I2C: i2c::I2c<Error = E>,
+    I2C: i2c::I2c,
 {
     /// Creates a new driver instance in the `Uninitialized` state.
     ///
-    /// This does not communicate with the sensor yet.
+    /// This method does not yet communicate with the sensor.
     ///
     /// # Arguments
     /// * `i2c` - The I2C bus object.
@@ -439,21 +331,34 @@ where
             i2c,
             address,
             calib_data: CalibData::default(),
-            current_wait_time: Milliseconds(0),
+            config: Config::default(),
+            _state: PhantomData,
+        }
+    }
+
+    /// Creates a new driver instance with a pre-defined configuration.
+    ///
+    /// Use the `BME680Builder` to create the `config` object.
+    pub fn with_config(i2c: I2C, address: u8, config: Config) -> Bme680<I2C, Uninitialized> {
+        Bme680 {
+            i2c,
+            address,
+            calib_data: CalibData::default(),
+            config,
             _state: PhantomData,
         }
     }
 }
 
-impl<I2C, STATE, E> Bme680<I2C, STATE>
+impl<I2C, STATE> Bme680<I2C, STATE>
 where
-    I2C: i2c::I2c<Error = E>,
+    I2C: i2c::I2c,
 {
     /// Performs a soft-reset of the sensor.
     ///
-    /// This resets all internal registers to their default values.
+    /// This resets all internal registers to their default values (Power-On-Reset).
     /// A delay of at least 2ms is required after the reset command.
-    fn reset(&mut self, delay: &mut impl DelayNs) -> error::Result<(), E> {
+    fn reset(&mut self, delay: &mut impl DelayNs) -> error::Result<()> {
         self.write_reg(&[regs::ADDR_RESET, msks::MSK_RESET])?;
 
         delay.delay_ms(2);
@@ -462,49 +367,96 @@ where
     }
 
     /// Reads data from a starting register address into a provided buffer.
-    ///
-    /// This is a low-level helper function for I2C communication.
-    fn read_into(&mut self, reg_address: u8, buffer: &mut [u8]) -> error::Result<(), E> {
+    fn read_into(&mut self, reg_address: u8, buffer: &mut [u8]) -> error::Result<()> {
         self.i2c
             .write_read(self.address, &[reg_address], buffer)
-            .map_err(|e| error::Bme680Error::I2CError(e))
+            .map_err(|_| error::Bme680Error::I2CError)
     }
 
     /// Reads a single byte from a specific register address.
-    fn read_reg_byte(&mut self, reg_address: u8) -> error::Result<u8, E> {
+    fn read_reg_byte(&mut self, reg_address: u8) -> error::Result<u8> {
         let mut buffer = [0];
 
         self.i2c
             .write_read(self.address, &[reg_address], &mut buffer)
-            .map_err(|e| error::Bme680Error::I2CError(e))?;
+            .map_err(|_| error::Bme680Error::I2CError)?;
 
         Ok(buffer[0])
     }
 
-    /// Writes a byte slice (typically `[Register, Value]`) to the sensor.
-    fn write_reg(&mut self, data: &[u8]) -> error::Result<(), E> {
+    /// Writes a byte slice (typically `[Register_Address, Value]`) to the sensor.
+    fn write_reg(&mut self, data: &[u8]) -> error::Result<()> {
         self.i2c
             .write(self.address, data)
-            .map_err(|e| error::Bme680Error::I2CError(e))?;
+            .map_err(|_| error::Bme680Error::I2CError)?;
+        Ok(())
+    }
+
+    /// Configures the heater duration and target temperature for the current gas profile.
+    ///
+    /// This function utilizes the current `ambient_temp` to calculate the correct
+    /// heater resistance value needed to reach the target temperature.
+    fn set_gas_heater_profile(&mut self) -> error::Result<()> {
+        self.config_heater_on_time()?;
+        self.config_target_resistance(None)?;
+
+        Ok(())
+    }
+
+    /// Selects one of the 10 available gas heater profiles (0-9) in the sensor.
+    fn select_gas_profile(&mut self, index: GasProfileIndex) -> error::Result<()> {
+        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+
+        // Clear NB_CONV bits using mask, then set new profile index
+        self.write_reg(&[
+            regs::ADDR_CTRL_GAS_1,
+            (register & !msks::MSK_NB_CONV) | (index as u8),
+        ])?;
+
+        Ok(())
+    }
+
+    /// Enables the gas sensing functionality (sets `RUN_GAS` bit).
+    fn enable_gas_measurement(&mut self) -> error::Result<()> {
+        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+        // Set RUN_GAS bit (Bit 4)
+        self.write_reg(&[
+            regs::ADDR_CTRL_GAS_1,
+            (register & !msks::MSK_RUN_GAS) | msks::MSK_RUN_GAS,
+        ])?;
+        Ok(())
+    }
+
+    /// Disables the gas sensing functionality to save power.
+    fn disable_gas_measurement(&mut self) -> error::Result<()> {
+        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+        // Clear RUN_GAS bit (Bit 4)
+        self.write_reg(&[regs::ADDR_CTRL_GAS_1, register & !msks::MSK_RUN_GAS])?;
         Ok(())
     }
 }
 
-impl<I2C, E> Bme680<I2C, Uninitialized>
+impl<I2C> Bme680<I2C, Uninitialized>
 where
-    I2C: i2c::I2c<Error = E>,
+    I2C: i2c::I2c,
 {
     /// Initializes the sensor: performs a soft-reset and loads factory calibration data.
     ///
-    /// This transitions the driver state from `Uninitialized` to `Ready`.
+    /// This consumes the `Uninitialized` driver and returns a `Ready` instance.
+    ///
+    /// # Process
+    /// 1. Soft Reset.
+    /// 2. Apply configuration (oversampling, IIR filter, gas settings).
+    /// 3. Read calibration coefficients from ROM.
     ///
     /// # Errors
-    /// Returns an error if the I2C communication fails during reset or calibration reading.
-    pub fn init(mut self, delay: &mut impl DelayNs) -> error::Result<Bme680<I2C, Ready>, E> {
+    /// Returns an error if I2C communication fails or if the sensor is unresponsive.
+    pub fn init(mut self, delay: &mut impl DelayNs) -> error::Result<Bme680<I2C, Ready>> {
         // Sensor requires time to start up before reset
         delay.delay_ms(2);
 
         self.reset(delay)?;
+        self.apply_config()?;
 
         // Read the factory calibration data (requires ~25ms I2C traffic)
         let calib_data = self.get_calib_data()?;
@@ -513,16 +465,71 @@ where
             i2c: self.i2c,
             address: self.address,
             calib_data: calib_data,
-            current_wait_time: Milliseconds(0),
+            config: self.config,
             _state: PhantomData,
         })
+    }
+
+    /// Applies the full sensor configuration defined in `self.config`.
+    ///
+    /// This sets up oversampling rates, IIR filters, and activates the gas sensor
+    /// if a profile is present.
+    fn apply_config(&mut self) -> error::Result<()> {
+        self.config_oversampling()?;
+        self.config_iir_filter()?;
+
+        if let Some(profile) = self.config.gas_profile {
+            self.enable_gas_measurement()?;
+            self.select_gas_profile(profile.index)?;
+            self.set_gas_heater_profile()?;
+        } else {
+            self.disable_gas_measurement()?;
+        }
+
+        Ok(())
+    }
+
+    /// Sets oversampling rates for Humidity, Temperature, and Pressure.
+    ///
+    /// Writes to registers `CTRL_HUM` and `CTRL_MEAS`.
+    fn config_oversampling(&mut self) -> error::Result<()> {
+        // Humidity configuration (Register 0x72)
+        // We must read first to preserve other bits if they existed
+        let ctrl_hum = self.read_reg_byte(regs::ADDR_CTRL_HUM)?;
+        let new_hum = (ctrl_hum & !msks::MSK_OSRS_H) | self.config.osrs_config.hum_osrs as u8;
+        self.write_reg(&[regs::ADDR_CTRL_HUM, new_hum])?;
+
+        // Temperature & Pressure configuration (Register 0x74)
+        let ctrl_meas = self.read_reg_byte(regs::ADDR_CTRL_MEAS)?;
+
+        // Prepare new bits
+        let temp_pres_combined = ((self.config.osrs_config.temp_osrs as u8) << 5)
+            | ((self.config.osrs_config.pres_osrs as u8) << 2);
+
+        // Clear old bits (Using !Mask) and set new ones
+        let new_meas = (ctrl_meas & !(msks::MSK_OSRS_T | msks::MSK_OSRS_P)) | temp_pres_combined;
+
+        self.write_reg(&[regs::ADDR_CTRL_MEAS, new_meas])?;
+
+        Ok(())
+    }
+
+    /// Configures the IIR (Infinite Impulse Response) filter coefficient.
+    ///
+    /// The IIR filter suppresses noise in pressure and temperature measurements.
+    fn config_iir_filter(&mut self) -> error::Result<()> {
+        let register = self.read_reg_byte(regs::ADDR_CONFIG)?;
+        // Clear filter bits and set new value
+        let new_reg_val = (register & !msks::MSK_FILTER) | ((self.config.iir_filter as u8) << 2);
+        self.write_reg(&[regs::ADDR_CONFIG, new_reg_val])?;
+        Ok(())
     }
 
     /// Reads factory-fused calibration coefficients from the sensor's ROM.
     ///
     /// The BME680 stores calibration data in two non-contiguous memory blocks.
     /// These bytes are required to compensate the raw ADC values into physical units.
-    fn get_calib_data(&mut self) -> error::Result<CalibData, E> {
+    fn get_calib_data(&mut self) -> error::Result<CalibData> {
         let mut calib_data = CalibData::default();
         let mut buffer = [0u8; reg_sizes::SIZE_CALIB_TOTAL];
 
@@ -573,56 +580,24 @@ where
     }
 }
 
-impl<I2C, E> Bme680<I2C, Ready>
+impl<I2C> Bme680<I2C, Ready>
 where
-    I2C: i2c::I2c<Error = E>,
+    I2C: i2c::I2c,
 {
-    /// Applies a full sensor configuration.
+    /// Triggers a full measurement cycle (Forced Mode), waits for completion, and returns the data.
     ///
-    /// This method sets oversampling, filters, and gas profiles.
-    /// If `config.gas_profile` is `None`, the gas sensor is disabled to save power.
-    pub fn configure_sensor(&mut self, config: &mut Config) -> error::Result<(), E> {
-        self.config_oversampling(&config.osrs_config)?;
-        self.config_iir_filter(config.iir_filter)?;
-
-        if let Some(x) = config.gas_profile {
-            self.enable_gas_measurement()?;
-            self.select_gas_profile(&x)?;
-            self.set_gas_heater_profile(x, config.ambient_temp)?;
-        } else {
-            self.disable_gas_measurement()?;
-        }
-
-        Ok(())
-    }
-
-    /// Configures heating duration and target temperature for a gas profile.
+    /// This is the primary method for retrieving sensor data. It handles the entire sequence:
+    /// 1. Wakes the sensor (Forced Mode).
+    /// 2. Waits for the TPH measurement + Gas Heating duration.
+    /// 3. Reads raw ADC data.
+    /// 4. Compensates raw values using factory calibration data.
     ///
-    /// This calculates the necessary register value based on the current ambient temperature.
-    pub fn set_gas_heater_profile(
-        &mut self,
-        config: GasProfile,
-        amb_temp: Celsius,
-    ) -> error::Result<(), E> {
-        self.config_heater_on_time(config.wait_time, config.index)?;
-        self.config_target_resistance(config.target_temp, amb_temp, config.index)?;
-
-        Ok(())
-    }
-
-    /// Triggers a measurement in 'Forced Mode', waits for completion, and returns compensated data.
-    ///
-    ///
-    ///
-    /// # Power Saving
-    /// If all measurements are set to `Skipped` and gas is disabled, this function
-    /// returns immediately with default values, consuming minimal power.
-    pub fn read_new_data(&mut self, delay: &mut impl DelayNs) -> error::Result<Measurement, E> {
-        // Read config back from sensor to ensure we don't wait unnecessarily
-        let meas_config = self.get_meas_config()?;
-
+    /// # Power Optimization
+    /// If all measurements are set to `Skipped` and gas is disabled in the `Config`,
+    /// this function returns immediately with a default `Measurement`, avoiding I2C traffic.
+    pub fn read_new_data(&mut self, delay: &mut impl DelayNs) -> error::Result<Measurement> {
         // Optimization: Don't trigger a measurement if nothing is enabled.
-        if !meas_config.gas_enabled && meas_config.osrs_config.is_all_skipped() {
+        if self.config.gas_disabled() && self.config.osrs_config.is_all_skipped() {
             return Ok(Measurement::default());
         }
 
@@ -631,8 +606,8 @@ where
 
         // 2. Wait for heating phase (if gas is enabled)
         // The sensor measures T, P, H first, then heats up for gas measurement.
-        if meas_config.gas_enabled {
-            delay.delay_ms(self.current_wait_time.0);
+        if let Some(profile) = self.config.gas_profile {
+            delay.delay_ms(profile.wait_time.0);
         }
 
         // 3. Poll for "New Data" bit and read ADC values
@@ -644,60 +619,74 @@ where
         let mut gas = 0;
 
         // 4. Apply mathematical compensation to raw values (if not skipped)
-        if meas_config.osrs_config.temp_osrs != Oversampling::Skipped {
+        if self.config.osrs_config.temp_osrs != Oversampling::Skipped {
             temp = self.calc_temp(raw_data.temp_adc);
 
-            // Humidity and Pressure compensation depends on "fine temperature"
-            if meas_config.osrs_config.hum_osrs != Oversampling::Skipped {
+            // Humidity and Pressure compensation depends on "fine temperature" (t_fine)
+            if self.config.osrs_config.hum_osrs != Oversampling::Skipped {
                 hum = self.calc_hum(temp.temp_comp, raw_data.hum_adc);
             }
 
-            if meas_config.osrs_config.pres_osrs != Oversampling::Skipped {
+            if self.config.osrs_config.pres_osrs != Oversampling::Skipped {
                 pres = self.calc_pres(temp.temp_fine, raw_data.press_adc);
             }
         }
 
-        // 5. Check gas validity bits
-        if meas_config.gas_enabled && !raw_data.gas_valid_r {
+        // 5. Check gas validity bits provided by the sensor
+        if self.config.gas_enabled() && !raw_data.gas_valid_r {
             return Err(error::Bme680Error::GasDataNotReady);
-        } else if meas_config.gas_enabled && !raw_data.heat_stab_r {
+        } else if self.config.gas_enabled() && !raw_data.heat_stab_r {
             return Err(error::Bme680Error::HeaterNotStable);
         }
 
-        if meas_config.gas_enabled {
+        if self.config.gas_enabled() {
             gas = self.calc_gas(raw_data.gas_adc, raw_data.gas_range);
         }
 
         Ok(Measurement {
-            temp: Temperature(temp.temp_comp),
+            temp: Celsius(temp.temp_comp),
             hum: Humidity(hum),
             pres: Pressure(pres),
             gas: Gas(gas),
         })
     }
 
-    /// Reads the Chip ID from the sensor (expected value: 0x61).
-    pub fn read_chip_id(&mut self) -> error::Result<u8, E> {
+    /// Reads the Chip ID from the sensor.
+    ///
+    /// Used to verify communication. Expected value is usually `0x61`.
+    pub fn read_chip_id(&mut self) -> error::Result<u8> {
         Ok(self.read_reg_byte(regs::ADDR_ID)?)
     }
 
-    /// Selects one of the 10 available gas heater profiles.
-    pub fn select_gas_profile(&mut self, profile: &GasProfile) -> error::Result<(), E> {
-        self.current_wait_time = profile.wait_time;
-        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
+    /// Updates the ambient temperature used for gas heater calculation.
+    ///
+    /// **Important:** To maintain stability, avoid calling this method after every single measurement.
+    /// Only update if the temperature has changed significantly (e.g. > 1°C), as changes
+    /// to the heater resistance can cause the gas sensor values to fluctuate temporarily.
+    pub fn update_ambient_temp(&mut self, temp: Celsius) -> error::Result<()> {
+        self.config_target_resistance(Some(temp))?;
 
-        // Clear NB_CONV bits using mask, then set new profile index
-        self.write_reg(&[
-            regs::ADDR_CTRL_GAS_1,
-            (register & !msks::MSK_NB_CONV) | (profile.index as u8),
-        ])?;
+        Ok(())
+    }
+
+    /// Switches the active gas profile to a new one.
+    ///
+    /// This updates the configuration, selects the profile on the sensor, and recalculates
+    /// the heater resistance values.
+    pub fn switch_profile(&mut self, profile: GasProfile) -> error::Result<()> {
+        self.config.gas_profile = Some(profile);
+
+        self.select_gas_profile(profile.index)?;
+        self.set_gas_heater_profile()?;
+
         Ok(())
     }
 
     /// Polls the sensor until new data is available and reads all ADC values.
     ///
-    /// This method includes a timeout mechanism (max. 50ms).
-    fn get_raw_data(&mut self, delay: &mut impl DelayNs) -> error::Result<RawData, E> {
+    /// This method includes a timeout mechanism (max. 50ms) to prevent infinite loops
+    /// if the sensor becomes unresponsive.
+    fn get_raw_data(&mut self, delay: &mut impl DelayNs) -> error::Result<RawData> {
         let mut new_data = false;
         let mut timeout_us = 50000; // 50ms Timeout
 
@@ -706,7 +695,7 @@ where
                 return Err(error::Bme680Error::Timeout);
             }
             // Check bit 7 (MSB) in EAS_STATUS_0 register
-            // Note: 0x80 is implied for Bit 7, or we could add MSK_NEW_DATA later
+            // Note: 0x80 is implied for Bit 7
             new_data = (self.read_reg_byte(regs::ADDR_EAS_STATUS_0)? >> 7) != 0;
 
             delay.delay_us(500);
@@ -715,7 +704,7 @@ where
 
         let mut buffer = [0u8; reg_sizes::SIZE_RAW_DATA];
 
-        // Burst read starting from ADDR_PRESS_MSB Register
+        // Burst read starting from ADDR_PRESS_MSB Register (0x1F)
         self.read_into(regs::ADDR_PRESS_MSB, &mut buffer)?;
 
         // Reconstruct 20-bit and 16-bit ADC values from register bytes
@@ -744,100 +733,14 @@ where
         })
     }
 
-    /// Sets oversampling rates for Humidity, Temperature, and Pressure.
-    ///
-    /// Writes to registers CTRL_HUM and CTRL_MEAS.
-    fn config_oversampling(&mut self, osrs_config: &OversamplingConfig) -> error::Result<(), E> {
-        // Humidity configuration (Register 0x72)
-        // We must read first to preserve other bits if they existed (though CTRL_HUM usually only has SPI bit)
-        let ctrl_hum = self.read_reg_byte(regs::ADDR_CTRL_HUM)?;
-        let new_hum = (ctrl_hum & !msks::MSK_OSRS_H) | osrs_config.hum_osrs as u8;
-        self.write_reg(&[regs::ADDR_CTRL_HUM, new_hum])?;
-
-        // Temperature & Pressure configuration (Register 0x74)
-        let ctrl_meas = self.read_reg_byte(regs::ADDR_CTRL_MEAS)?;
-
-        // Prepare new bits
-        let temp_pres_combined =
-            ((osrs_config.temp_osrs as u8) << 5) | ((osrs_config.pres_osrs as u8) << 2);
-
-        // Clear old bits (Using !Mask) and set new ones
-        let new_meas = (ctrl_meas & !(msks::MSK_OSRS_T | msks::MSK_OSRS_P)) | temp_pres_combined;
-
-        self.write_reg(&[regs::ADDR_CTRL_MEAS, new_meas])?;
-
-        Ok(())
-    }
-
-    /// Configures the IIR filter coefficient.
-    fn config_iir_filter(&mut self, iir_filter: IIRFilter) -> error::Result<(), E> {
-        let register = self.read_reg_byte(regs::ADDR_CONFIG)?;
-        // Clear filter bits and set new value
-        let new_reg_val = (register & !msks::MSK_FILTER) | ((iir_filter as u8) << 2);
-        self.write_reg(&[regs::ADDR_CONFIG, new_reg_val])?;
-        Ok(())
-    }
-
-    /// Enables the gas sensing functionality in the sensor (CTRL_GAS_1).
-    fn enable_gas_measurement(&mut self) -> error::Result<(), E> {
-        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
-        // Set RUN_GAS bit (Bit 4)
-        self.write_reg(&[
-            regs::ADDR_CTRL_GAS_1,
-            (register & !msks::MSK_RUN_GAS) | msks::MSK_RUN_GAS,
-        ])?;
-        Ok(())
-    }
-
-    /// Disables the gas sensing functionality in the sensor.
-    fn disable_gas_measurement(&mut self) -> error::Result<(), E> {
-        let register = self.read_reg_byte(regs::ADDR_CTRL_GAS_1)?;
-        // Clear RUN_GAS bit (Bit 4)
-        self.write_reg(&[regs::ADDR_CTRL_GAS_1, register & !msks::MSK_RUN_GAS])?;
-        Ok(())
-    }
-
     /// Activates 'Forced Mode' to trigger a single measurement cycle.
     ///
-    /// The sensor returns to Sleep mode automatically after the measurement.
-    fn activate_forced_mode(&mut self) -> error::Result<(), E> {
+    /// In Forced Mode, the sensor performs one TPHG cycle and then automatically
+    /// returns to Sleep Mode.
+    fn activate_forced_mode(&mut self) -> error::Result<()> {
         let register = self.read_reg_byte(regs::ADDR_CTRL_MEAS)?;
         // Clear Mode bits and set to 01 (Forced)
         self.write_reg(&[regs::ADDR_CTRL_MEAS, (register & !msks::MSK_MODE) | 0b01])?;
         Ok(())
-    }
-
-    /// Reads the current configuration back from the sensor.
-    ///
-    /// Used internally to verify which sensors are enabled before waiting/reading.
-    fn get_meas_config(&mut self) -> error::Result<MeasConfig, E> {
-        let mut buffer = [0u8; 4];
-
-        // Burst read starting from CTRL_GAS_1 register
-        self.read_into(regs::ADDR_CTRL_GAS_1, &mut buffer)?;
-
-        // Extract values using masks (AND logic)
-        // Bit 4 of byte 0
-        let gas_enabled = (buffer[0] & msks::MSK_RUN_GAS) != 0;
-
-        // Bits 0-2 of byte 1
-        let osrs_h = buffer[1] & msks::MSK_OSRS_H;
-
-        // Bits 2-4 of byte 3 (CTRL_MEAS is buffer[3] relative to CTRL_GAS_1)
-        let osrs_p = (buffer[3] & msks::MSK_OSRS_P) >> 2;
-
-        // Bits 5-7 of byte 3
-        let osrs_t = (buffer[3] & msks::MSK_OSRS_T) >> 5;
-
-        let osrs_config = OversamplingConfig {
-            temp_osrs: Oversampling::from_u8(osrs_t),
-            hum_osrs: Oversampling::from_u8(osrs_h),
-            pres_osrs: Oversampling::from_u8(osrs_p),
-        };
-
-        Ok(MeasConfig {
-            osrs_config,
-            gas_enabled,
-        })
     }
 }

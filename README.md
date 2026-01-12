@@ -37,7 +37,8 @@ A type-safe, `no_std` Rust driver for the **Bosch BME680** environmental sensor.
 └── bme680-driver/
     ├── src/
     │   ├── lib.rs
-    │   └── calc.rs
+    │   ├── calc.rs
+    │   └── settings.rs
     ├── examples/
     │   └── stm32f407.rs
     ├── .cargo/
@@ -53,7 +54,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-bme680-driver = "0.2.1"
+bme680-driver = "0.3.0"
 ```
 
 ---
@@ -63,55 +64,53 @@ bme680-driver = "0.2.1"
 ```rust
 use bme680_driver::*;
 
-// Initialize I2C and Delay from your HAL...
-// let i2c = ...
-// let mut delay = ...
-
-let bme = Bme680::new(i2c, 0x76);
-let mut bme = bme.init(&mut delay).expect("Failed to init BME680");
-
-let mut config = Config {
-    osrs_config: OversamplingConfig {
-        temp_osrs: Oversampling::X2,
-        hum_osrs: Oversampling::X1,
-        // Example: Disable pressure measurement to save power and time
-        pres_osrs: Oversampling::Skipped,
-    },
-    iir_filter: IIRFilter::IIR0,
-    // Enable gas measurement by providing a profile (wrap in Some)
-    gas_profile: Some(GasProfile {
-        index: GasProfileIndex::Profile0,
-        target_temp: Celsius(300),
-        wait_time: Milliseconds(300),
-    }),
-    ambient_temp: Celsius(2300), // 23.00 °C initial guess
+// --- 1. Sensor-Konfiguration via Builder ---
+// Wir definieren ein Profil für die Gassensor-Heizplatte.
+let gas_profile = GasProfile {
+    index: GasProfileIndex::Profile0,
+    target_temp: Celsius(300),      // Ziel: 300°C
+    wait_time: Milliseconds(300),   // 300ms Aufheizzeit
 };
 
-bme.configure_sensor(&mut config).unwrap();
+let config = BME680Builder::new()
+    .temp_oversampling(Oversampling::X2)
+    .hum_oversampling(Oversampling::X1)
+    .pres_oversampling(Oversampling::Skipped) // Druckmessung deaktiviert
+    .gas_profile(Some(gas_profile))
+    .ambient_temp(Celsius(2100))    // Erste Schätzung: 21.00°C
+    .build();
+
+// --- 2. Initialisierung (Typestate: Uninitialized -> Ready) ---
+// I2C und Delay kommen von deinem HAL (z.B. stm32f4xx-hal)
+let mut bme = Bme680::with_config(i2c, 0x76, config)
+    .init(&mut delay)
+    .expect("BME680 Init fehlgeschlagen");
+
+// Tracking für die Heizungskompensation
+let mut last_heater_update_temp = Celsius(2100);
 
 loop {
-    // Perform measurement (waits automatically for heating if enabled)
+    // Messung triggern (wartet automatisch auf die Heizphase)
     let data = bme.read_new_data(&mut delay).unwrap();
     
-    // Use helper methods to format data (no floats needed!)
-    let (temp_whole, temp_frac) = data.temp.split();
-    let (hum_whole, hum_frac) = data.hum.split();
+    // Daten formatieren ohne Floats (Festkomma-Arithmetik)
+    let (t_int, t_frac) = data.temp.split();
+    let (h_int, h_frac) = data.hum.split();
     
-    // Log formatted data (e.g., via defmt)
-    defmt::println!("Temperature:    {}.{} °C", temp_whole, temp_frac);
-    defmt::println!("Humidity:       {}.{} %", hum_whole, hum_frac);
-    defmt::println!("Gas Resistance: {}  Ohm", data.gas.0);
+    defmt::println!("Temp: {}.{} °C", t_int, t_frac);
+    defmt::println!("Hum:  {}.{} %", h_int, h_frac);
     
-    // Pressure was skipped, so it returns default/zero values
-    // defmt::println!("Pressure: Skipped"); 
-    
-    defmt::println!("");
-    
-    // Dynamically update heater profile with current ambient temperature.
-    // We only do this if gas measurement is actually enabled.
-    if let Some(profile) = config.gas_profile {
-        // We access the raw value (.0) to wrap it into Celsius
-        bme.set_gas_heater_profile(profile, Celsius(data.temp.0)).unwrap();
+    if data.gas.0 > 0 {
+        defmt::println!("Gas:  {} Ohm", data.gas.0);
+    }
+
+    // --- Dynamische Heizungskompensation ---
+    // Wir aktualisieren die Heizparameter nur bei signifikanten Temp-Änderungen (> 2°C),
+    // um chemische Instabilitäten (Sprünge) im Gassensor zu vermeiden.
+    if (data.temp.0 - last_heater_update_temp.0).abs() >= 2000 {
+        bme.update_ambient_temp(data.temp).unwrap();
+        last_heater_update_temp = data.temp;
+        defmt::info!("Heizprofil an neue Umgebungstemperatur angepasst.");
     }
     
     delay.delay_ms(5000);

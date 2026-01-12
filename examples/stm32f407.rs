@@ -1,20 +1,16 @@
 //! Example: Basic environmental monitoring with the BME680 on an STM32F407.
 //!
 //! This example demonstrates:
-//! 1. **Initialization**: Setting up I2C and the BME680 driver.
-//! 2. **Flexible Configuration**: Enabling or disabling specific measurements
-//!    (Temperature, Humidity, Pressure, Gas) to save power.
-//! 3. **Data Processing**: Reading measurements and manually formatting the
-//!    fixed-point data for logging.
-//! 4. **Dynamic Compensation**: Updating the gas heater profile based on the
-//!    current ambient temperature to ensure accurate gas resistance readings.
+//! 1. **Initialization**: Setting up I2C and the BME680 driver using the Type-State pattern.
+//! 2. **Flexible Configuration**: Using the `BME680Builder` to customize measurements.
+//! 3. **Fixed-Point Handling**: Utilizing the `.split()` method for easy logging without floats.
+//! 4. **Gas Sensing**: Configuring a heater profile for VOC detection.
+//! 5. **Stability Management**: Implementing a temperature hysteresis to prevent gas value jumps.
 
 #![no_main]
 #![no_std]
 #![deny(unsafe_code)]
 
-// The driver is now independent of logging frameworks.
-// We use defmt explicitly in the example code only.
 use bme680_driver::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -41,91 +37,73 @@ fn main() -> ! {
         &mut rcc,
     );
 
-    // Setup a delay provider (TIM6) used by the driver for internal timings
     let mut delay = dp.TIM6.delay_us(&mut rcc);
 
-    // --- 2. Driver Initialization ---
-    // Instantiate driver with the default I2C address (0x76 or 0x77)
-    let bme680 = Bme680::new(i2c, 0x76);
-
-    // Initialize the sensor (performs Soft-reset and reads calibration data)
-    let mut bme680 = bme680
-        .init(&mut delay)
-        .expect("Failed to initialize BME680");
-
-    // --- 3. Sensor Configuration ---
-    // Define a gas heater profile: Target 300°C with a 300ms heating duration.
-    // This allows detection of VOCs (Volatile Organic Compounds).
-    let gas_profile0 = GasProfile {
+    // --- 2. Sensor Configuration ---
+    // Define a gas heater profile: Target 300°C with 300ms duration.
+    let my_gas_profile = GasProfile {
         index: GasProfileIndex::Profile0,
         target_temp: Celsius(300),
         wait_time: Milliseconds(300),
     };
 
-    // Configure sensor oversampling settings.
-    // You can disable individual measurements by setting them to `Skipped`.
-    let osrs_config = OversamplingConfig {
-        temp_osrs: Oversampling::X1,      // Enable Temperature
-        hum_osrs: Oversampling::X4,       // Enable Humidity
-        pres_osrs: Oversampling::Skipped, // Disable Pressure (saves power/time)
-    };
+    // Use the Builder to define initial state.
+    // Note: ambient_temp is given in milli-Celsius (2000 = 20.00 °C).
+    let config = BME680Builder::new()
+        .ambient_temp(Celsius(2000))
+        .temp_oversampling(Oversampling::X2)
+        .hum_oversampling(Oversampling::X1)
+        .pres_oversampling(Oversampling::Skipped) // Pressure disabled to save power/time
+        .gas_profile(Some(my_gas_profile))
+        .build();
 
-    // Assemble the full sensor configuration
-    let mut config = Config {
-        osrs_config,
-        iir_filter: IIRFilter::IIR0,
-        // Pass `Some(profile)` to enable gas measurement, or `None` to disable it.
-        gas_profile: Some(gas_profile0),
-        // Initial ambient temperature estimate for the heater algorithm
-        ambient_temp: Celsius(2300), // 23.00 °C
-    };
+    // --- 3. Driver Initialization ---
+    // The driver starts 'Uninitialized' and consumes itself into a 'Ready' state via .init()
+    let mut bme680 = Bme680::with_config(i2c, 0x76, config)
+        .init(&mut delay)
+        .expect("Failed to initialize BME680");
 
-    // Apply configuration. This puts the sensor into the appropriate state.
-    bme680
-        .configure_sensor(&mut config)
-        .expect("Failed to configure sensor");
+    defmt::info!("BME680 initialized successfully");
+
+    // Track the last temperature used for heater calculation to implement hysteresis.
+    let mut last_updated_temp = config.ambient_temp;
 
     // --- 4. Measurement Loop ---
     loop {
-        // Trigger a measurement and wait for completion.
-        // This function automatically handles the varying delay times depending
-        // on which sensors (Gas/Pres/Hum) are enabled.
-        let data = bme680
-            .read_new_data(&mut delay)
-            .expect("Failed to read data");
+        // read_new_data triggers 'Forced Mode', waits for the TPHG duration, and reads results.
+        match bme680.read_new_data(&mut delay) {
+            Ok(data) => {
+                // Formatting: .split() returns (integer, fractional) for easy no-float logging.
+                let t = data.temp.split();
+                let h = data.hum.split();
 
-        // --- Data Formatting & Logging ---
-        // Since the driver uses fixed-point arithmetic, we use helper methods
-        // to separate integral and decimal parts for human-readable output.
+                defmt::println!("Temp: {}.{} °C", t.0, t.1);
+                defmt::println!("Hum:  {}.{} %", h.0, h.1);
+                defmt::println!("Pres: {} Pa (Skipped)", data.pres.0);
 
-        let temp = data.temp.split();
-        let hum = data.hum.split();
-        let pres = data.pres.as_hpa(); // Explicitly converts Pa to hPa
+                if data.gas.0 > 0 {
+                    defmt::println!("Gas Resistance: {} Ohm", data.gas.0);
+                }
 
-        // Log using defmt (or any other logging framework/UART)
-        defmt::println!("Temperature:    {}.{} °C", temp.0, temp.1);
-        defmt::println!("Humidity:       {}.{} %", hum.0, hum.1);
-
-        // Even if skipped, the driver returns a safe default (usually 0 or last value)
-        // or you can check configuration before printing.
-        defmt::println!("Pressure:       {}.{} hPa (Skipped)", pres.0, pres.1);
-
-        // Raw gas resistance access (higher resistance = cleaner air)
-        defmt::println!("Gas Resistance: {}  Ohm", data.gas.0);
-        defmt::println!("");
-
-        // --- Dynamic Heater Compensation ---
-        // The gas sensor's heating plate resistance relies on the ambient temperature.
-        // We update the profile using the just-measured temperature (`data.temp.0`)
-        // to ensure the plate hits exactly 300°C in the next cycle.
-
-        if let Some(profile) = config.gas_profile {
-            bme680
-                .set_gas_heater_profile(profile, Celsius(data.temp.0))
-                .expect("Failed to update heater profile");
+                // --- Dynamic Heater Compensation with Hysteresis ---
+                // Problem: Updating the heater resistance after every measurement causes
+                // thermal oscillations, leading to massive jumps in gas resistance values.
+                //
+                // Solution: Only update the heater profile if the ambient temperature
+                // changes by more than 2.00°C (2000 m°C). This balances accuracy and stability.
+                if (data.temp.0 - last_updated_temp.0).abs() >= 2000 {
+                    defmt::info!("Significant temp change detected. Recalibrating heater...");
+                    bme680
+                        .update_ambient_temp(data.temp)
+                        .expect("Failed to update ambient temperature!");
+                    last_updated_temp = data.temp;
+                }
+            }
+            Err(e) => defmt::error!("Measurement error: {:?}", e),
         }
 
-        // Wait 5 seconds before the next measurement cycle
+        // Wait 5 seconds between samples.
+        // Constant sampling helps the MOX sensor maintain a stable chemical state.
         delay.delay_ms(5000);
     }
 }
